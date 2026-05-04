@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
@@ -34,6 +35,9 @@ LOG_DIR.mkdir(exist_ok=True)
 MEMORY_DIR = PROJECT_ROOT / "memory"
 MEMORY_DIR.mkdir(exist_ok=True)
 RECENT_PATH = MEMORY_DIR / "recent.jsonl"
+FACTS_PATH = MEMORY_DIR / "facts.md"
+SUMMARY_PATH = MEMORY_DIR / "summary.md"
+RECENT_TAIL_LINES = 30  # how many recent.jsonl lines to inject into the prompt
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -75,16 +79,52 @@ def _is_authorized(user_id: int | None) -> bool:
     return user_id in ALLOWED_USER_IDS
 
 
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+def _recent_tail(n: int) -> tuple[str, int]:
+    """Return (last n lines of recent.jsonl, total line count). Both empty/0
+    if the file is missing."""
+    try:
+        text = RECENT_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "", 0
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    return "\n".join(lines[-n:]), len(lines)
+
+
 def _build_prompt(user_text: str) -> str:
+    """Inject memory/* directly so claude doesn't burn tool round-trips Reading
+    them. Each Read in -p mode is a full inference round-trip — eliminating the
+    three (facts/summary/recent) shaves ~15-40s off each turn."""
+    facts = _read_text(FACTS_PATH).strip()
+    summary = _read_text(SUMMARY_PATH).strip()
+    recent_tail, recent_total = _recent_tail(RECENT_TAIL_LINES)
+
     return (
+        f"<facts>\n{facts}\n</facts>\n\n"
+        f"<summary>\n{summary}\n</summary>\n\n"
+        f'<recent total_lines="{recent_total}" showing_last="{RECENT_TAIL_LINES}">\n'
+        f"{recent_tail}\n</recent>\n\n"
         "A Telegram user just sent you the message in <user_message>. "
-        "Follow CLAUDE.md exactly: read memory/ for context, decide your reply, "
-        "do compression / facts.md updates if warranted, then — as the very LAST "
-        "thing — output the reply as plain text. Do NOT write to "
-        "memory/recent.jsonl yourself; the orchestrator records each turn after "
-        "Telegram confirms delivery. Do NOT end on a tool call; the last "
-        "plain-text message is what Telegram receives. No preamble, no code "
-        "fences, no meta-commentary.\n\n"
+        "Context is already loaded above as <facts>, <summary>, <recent> — "
+        "do NOT Read memory/facts.md, memory/summary.md, or "
+        "memory/recent.jsonl yourself, that's wasted round-trips. "
+        "Follow CLAUDE.md for everything else: decide your reply, Write a "
+        "long-term fact to memory/facts.md if warranted, then — as the very "
+        "LAST thing — output the reply as plain text. "
+        "Do NOT write to memory/recent.jsonl yourself; the orchestrator "
+        "records each turn after Telegram confirms delivery. "
+        "Compression: total_lines on <recent> is recent.jsonl's full length. "
+        "Only if it exceeds 200 should you Read the full file, summarize the "
+        "earliest 100 lines into memory/summary.md, and trim recent.jsonl. "
+        "Otherwise leave both alone. "
+        "Do NOT end on a tool call; the last plain-text message is what "
+        "Telegram receives. No preamble, no code fences, no meta-commentary.\n\n"
         f"<user_message>\n{user_text}\n</user_message>"
     )
 
@@ -152,6 +192,7 @@ async def _call_claude(user_text: str) -> str:
     """Invoke `claude -p` and return its stdout. Raises on timeout / non-zero exit."""
     args = _build_args(_build_prompt(user_text))
     log.info("spawn claude pid=? cwd=%s model=%s", PROJECT_ROOT, CLAUDE_MODEL or "(default)")
+    started = time.monotonic()
     proc = await asyncio.create_subprocess_exec(
         *args,
         cwd=str(PROJECT_ROOT),
@@ -172,11 +213,14 @@ async def _call_claude(user_text: str) -> str:
         await proc.wait()
         raise
 
+    elapsed = time.monotonic() - started
     if proc.returncode != 0:
         err = stderr.decode(errors="replace").strip()
         raise RuntimeError(
-            f"claude exited {proc.returncode}: {err[:500] or '<no stderr>'}"
+            f"claude exited {proc.returncode} after {elapsed:.1f}s: "
+            f"{err[:500] or '<no stderr>'}"
         )
+    log.info("claude completed in %.1fs", elapsed)
     return stdout.decode(errors="replace").strip()
 
 
