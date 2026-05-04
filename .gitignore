@@ -1,0 +1,17 @@
+.env
+logs/
+memory/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+
+# Personal — only committed as templates (CLAUDE.md.example).
+# Each user maintains their own CLAUDE.md and personal journal locally.
+CLAUDE.md
+搭建日志.md
+*.local.md
+
+# Claude Code per-project settings (paths, allow lists, etc.)
+.claude/
