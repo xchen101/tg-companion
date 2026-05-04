@@ -8,9 +8,11 @@ Architecture (Phase 1):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from collections import defaultdict
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -29,7 +31,9 @@ from telegram.ext import (
 PROJECT_ROOT = Path(__file__).parent.resolve()
 LOG_DIR = PROJECT_ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
-(PROJECT_ROOT / "memory").mkdir(exist_ok=True)
+MEMORY_DIR = PROJECT_ROOT / "memory"
+MEMORY_DIR.mkdir(exist_ok=True)
+RECENT_PATH = MEMORY_DIR / "recent.jsonl"
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -74,13 +78,42 @@ def _is_authorized(user_id: int | None) -> bool:
 def _build_prompt(user_text: str) -> str:
     return (
         "A Telegram user just sent you the message in <user_message>. "
-        "Follow CLAUDE.md exactly: (1) Read memory/ for context, (2) decide your "
-        "reply in your head, (3) Write the new turn into memory/recent.jsonl, "
-        "then (4) — as the very LAST thing you do — output the reply as plain "
-        "text. Do NOT end on a tool call; the last plain-text message is what "
-        "Telegram receives. No preamble, no code fences, no meta-commentary.\n\n"
+        "Follow CLAUDE.md exactly: read memory/ for context, decide your reply, "
+        "do compression / facts.md updates if warranted, then — as the very LAST "
+        "thing — output the reply as plain text. Do NOT write to "
+        "memory/recent.jsonl yourself; the orchestrator records each turn after "
+        "Telegram confirms delivery. Do NOT end on a tool call; the last "
+        "plain-text message is what Telegram receives. No preamble, no code "
+        "fences, no meta-commentary.\n\n"
         f"<user_message>\n{user_text}\n</user_message>"
     )
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _append_turn(user_text: str, user_ts: str, assistant_text: str, assistant_ts: str) -> None:
+    """Append the user/assistant pair to memory/recent.jsonl. Called only after
+    Telegram has accepted the reply, so what's in memory always matches what the
+    user saw. The per-chat lock + the fact that claude has already exited means
+    no concurrent writer can race us."""
+    lines = [
+        json.dumps({"role": "user", "content": user_text, "ts": user_ts}, ensure_ascii=False),
+        json.dumps({"role": "assistant", "content": assistant_text, "ts": assistant_ts}, ensure_ascii=False),
+    ]
+    payload = "\n".join(lines) + "\n"
+    # Defend against a prior writer (e.g. claude compression) leaving no trailing \n.
+    if RECENT_PATH.exists() and RECENT_PATH.stat().st_size > 0:
+        with RECENT_PATH.open("rb") as f:
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) != b"\n":
+                payload = "\n" + payload
+    with RECENT_PATH.open("a", encoding="utf-8") as f:
+        f.write(payload)
+
+
+VAULT_DIR = "/home/xchen/Documents/sync'd"
 
 
 def _build_args(prompt: str) -> list[str]:
@@ -88,9 +121,11 @@ def _build_args(prompt: str) -> list[str]:
         CLAUDE_BIN,
         "-p",
         "--allowedTools",
-        "Read,Write",
+        "Read,Write,Edit,Glob,Grep,WebFetch,WebSearch",
         "--permission-mode",
-        "acceptEdits",
+        "bypassPermissions",
+        "--add-dir",
+        VAULT_DIR,
         "--output-format",
         "text",
     ]
@@ -175,6 +210,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     chat_id = msg.chat_id
     text = msg.text
+    user_ts = _now_iso()
     log.info("recv chat=%s user=%s len=%d", chat_id, user.id, len(text))
 
     async with _chat_locks[chat_id]:
@@ -205,12 +241,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         for chunk in _chunks(reply, TELEGRAM_MSG_LIMIT):
             await _send_with_retry(msg, chunk)
+        _append_turn(text, user_ts, reply, _now_iso())
         log.info("sent chat=%s reply_len=%d", chat_id, len(reply))
 
 
 async def _send_with_retry(msg, text: str, attempts: int = 4) -> None:
-    """Telegram API can hiccup; reply is already saved in memory/recent.jsonl,
-    so it's fine to keep trying. Backoff: 1s, 3s, 9s."""
+    """Telegram API can hiccup; retry with backoff 1s, 3s, 9s. If all attempts
+    fail we propagate, the outer handler logs, and the turn is NOT appended to
+    memory/recent.jsonl — keeping memory consistent with what the user saw."""
     delay = 1.0
     for i in range(1, attempts + 1):
         try:
