@@ -20,19 +20,34 @@ laptop or a small VM.
 Telegram update
     └─> bot.py (python-telegram-bot, async)
             ├─ per-chat asyncio.Lock  (serializes turns within one chat)
-            └─> subprocess: claude -p --allowedTools "Read,Write" ...
-                    ├─ reads CLAUDE.md (persona + step instructions)
-                    ├─ reads memory/{facts.md, summary.md, recent.jsonl}
+            ├─ photos saved to memory/media/, prompt gains <image path="..."/>
+            ├─ media-group albums debounced 1.5 s into one turn
+            └─> subprocess: claude -p --allowedTools Read,Write,Edit,Glob,Grep,WebFetch,WebSearch
+                    ├─ memory/{facts.md, summary.md, recent.jsonl} injected directly
+                    │  into the prompt (so claude doesn't re-Read them every turn)
+                    ├─ Reads any <image path="..."/> attachments
                     ├─ composes the reply (in its head)
-                    ├─ writes the new turn into memory/recent.jsonl
+                    ├─ optionally Writes a new long-term fact to memory/facts.md
                     └─ outputs the reply text on stdout
             └─> reply_text() → Telegram (with retry on transient timeouts)
+            └─> orchestrator appends the turn to memory/recent.jsonl
+                only after Telegram confirms delivery
 ```
 
 The orchestration in `bot.py` is intentionally dumb. All the interesting
 choices — what Cas (or your persona) reads, when she updates memory, when she
 compacts old turns into a summary — live in `CLAUDE.md` and are easy to tweak
 without touching Python.
+
+## Supported message types
+
+| Incoming | Behavior |
+|---|---|
+| Text | Plain pass-through. |
+| Photo (single) | Downloaded to `memory/media/<chat_id>_<msg_id>.jpg`; Claude reads it via the `Read` tool and replies. |
+| Photo album (media group) | Debounced 1.5 s, then handled as a single turn with multiple `<image>` attachments. |
+| Sticker | Routed as text `[贴纸] {emoji}` — the sticker's emoji is what reaches Claude. No image fetch. |
+| Voice / video / audio / document | The orchestrator hands Claude an apology stub so the persona can decline in its own voice instead of a hardcoded fallback. |
 
 ## Quick start
 
@@ -72,7 +87,8 @@ find your bot, send `/start`, then send a message.
 | `.env.example` | Template for runtime config. Copy to `.env`. |
 | `memory/facts.md` | Long-term facts about the user. Updated by Claude when it learns durable info. (Created on first run.) |
 | `memory/summary.md` | Rolling summary of older turns. Appended to when `recent.jsonl` exceeds 200 lines. |
-| `memory/recent.jsonl` | Recent raw turns (user + assistant), JSON-per-line. Appended every reply. Compacted at 200 lines. |
+| `memory/recent.jsonl` | Recent raw turns (user + assistant), JSON-per-line. Appended every reply. Compacted at 200 lines. Photo turns carry an `image_path` field on the user row. |
+| `memory/media/` | Photos sent by the user, named `<chat_id>_<msg_id>.jpg`. Currently retained indefinitely; cleanup will land alongside cron-driven compaction. |
 | `logs/bot.log` | Rotating log (5 × 2 MB). |
 
 ## Configuration knobs (`.env`)
@@ -162,11 +178,14 @@ feel off. Two options:
 - Switch `bot.py` to invoke `claude -p --bare --append-system-prompt-file CLAUDE.md ...`
   to skip auto-discovery entirely.
 
-## Phase 2 (not built)
+## Not yet built
 
-- Voice replies via Fish Audio TTS
-- Telegram sticker reactions
-- Cron-driven memory compaction (so reply latency doesn't include compaction)
+- Voice **replies** via Fish Audio TTS (incoming voice messages are already
+  handled — Claude just declines verbally for now)
+- **Outbound** sticker reactions from Claude (incoming stickers are routed as
+  emoji text)
+- Cron-driven memory compaction, including cleanup of `memory/media/`
+  photos that get summarized out of `recent.jsonl`
 
 ## License
 
