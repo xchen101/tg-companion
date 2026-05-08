@@ -34,13 +34,37 @@ LOG_DIR = PROJECT_ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 MEMORY_DIR = PROJECT_ROOT / "memory"
 MEMORY_DIR.mkdir(exist_ok=True)
-MEDIA_DIR = MEMORY_DIR / "media"
-MEDIA_DIR.mkdir(exist_ok=True)
-RECENT_PATH = MEMORY_DIR / "recent.jsonl"
-FACTS_PATH = MEMORY_DIR / "facts.md"
-SUMMARY_PATH = MEMORY_DIR / "summary.md"
 RECENT_TAIL_LINES = 30  # how many recent.jsonl lines to inject into the prompt
 ALBUM_DEBOUNCE_S = 1.5  # wait this long after the latest media-group photo before flushing
+
+# Memory is per-chat: memory/<chat_id>/{facts.md, summary.md, recent.jsonl, media/}.
+# In TG, a 1-1 chat has chat_id == user_id; group chats have negative ids.
+# Each chat is fully isolated — Cas in group A never sees facts from chat B.
+
+
+def _chat_dir(chat_id: int) -> Path:
+    p = MEMORY_DIR / str(chat_id)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _facts_path(chat_id: int) -> Path:
+    return _chat_dir(chat_id) / "facts.md"
+
+
+def _summary_path(chat_id: int) -> Path:
+    return _chat_dir(chat_id) / "summary.md"
+
+
+def _recent_path(chat_id: int) -> Path:
+    return _chat_dir(chat_id) / "recent.jsonl"
+
+
+def _media_dir(chat_id: int) -> Path:
+    p = _chat_dir(chat_id) / "media"
+    p.mkdir(exist_ok=True)
+    return p
+
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -53,6 +77,25 @@ _raw_ids = os.environ.get("ALLOWED_USER_IDS", "")
 ALLOWED_USER_IDS: set[int] = {
     int(x) for x in _raw_ids.replace(",", " ").split() if x.strip().lstrip("-").isdigit()
 }
+
+
+def _parse_user_names(raw: str) -> dict[int, str]:
+    """USER_NAMES env format: '435477395:Li,91713083:Domi'. Whitespace tolerant.
+    Lines without ':' or with non-int ids are skipped silently."""
+    names: dict[int, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if ":" not in pair:
+            continue
+        uid_str, _, name = pair.partition(":")
+        uid_str = uid_str.strip()
+        name = name.strip()
+        if uid_str.lstrip("-").isdigit() and name:
+            names[int(uid_str)] = name
+    return names
+
+
+USER_NAMES: dict[int, str] = _parse_user_names(os.environ.get("USER_NAMES", ""))
 
 TELEGRAM_MSG_LIMIT = 4000  # leave headroom under 4096
 ERROR_REPLY = "我休息一下，等会儿再聊。"
@@ -79,11 +122,74 @@ _chat_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 _album_buffers: dict[tuple[int, str], dict] = {}
 _album_lock = asyncio.Lock()
 
+# Filled by _post_init before run_polling. Used by _is_addressed to recognise
+# direct @-mentions / reply-to-bot in groups. We don't rely on Telegram's bot
+# privacy mode for this filtering — it has been empirically unreliable for our
+# bot (mentions silently dropped even with privacy ON, kick+re-add, fresh group).
+# Privacy OFF + this code-side check is the deterministic path.
+BOT_USER_ID: int | None = None
+BOT_USERNAME: str | None = None
+
 
 def _is_authorized(user_id: int | None) -> bool:
     if not ALLOWED_USER_IDS:
         return True  # whitelist disabled
     return user_id in ALLOWED_USER_IDS
+
+
+def _display_name(user) -> str:
+    """How Cas should refer to this speaker. USER_NAMES env wins (stable across
+    TG profile changes); otherwise fall back to TG profile fields."""
+    if user is None:
+        return "?"
+    if user.id in USER_NAMES:
+        return USER_NAMES[user.id]
+    return user.first_name or user.username or f"user_{user.id}"
+
+
+def _is_addressed(msg) -> bool:
+    """True if this message is for Cas. Private chat: always (the message is
+    by definition for the bot). Group chat: requires explicit address —
+    @mention by username, text_mention pointing at this bot, or a reply to
+    one of Cas's previous messages."""
+    if msg is None:
+        return False
+    chat = getattr(msg, "chat", None)
+    if chat is None:
+        return False
+    if chat.type == "private":
+        return True
+    # Bot identity not yet resolved: be conservative and ignore. In practice
+    # post_init runs before run_polling so this only matters during shutdown races.
+    if BOT_USER_ID is None:
+        return False
+    rt = getattr(msg, "reply_to_message", None)
+    if rt and getattr(rt, "from_user", None) and rt.from_user.id == BOT_USER_ID:
+        return True
+    text = msg.text or msg.caption or ""
+    entities = list(msg.entities or []) + list(msg.caption_entities or [])
+    for ent in entities:
+        if ent.type == "mention" and BOT_USERNAME:
+            handle = text[ent.offset : ent.offset + ent.length].strip().lstrip("@").lower()
+            if handle == BOT_USERNAME:
+                return True
+        elif ent.type == "text_mention" and ent.user and ent.user.id == BOT_USER_ID:
+            return True
+    return False
+
+
+async def _post_init(application) -> None:
+    """Cache bot identity once before polling so _is_addressed has what it
+    needs. Doing this in post_init guarantees it runs after the network is up
+    but before any update can arrive."""
+    global BOT_USER_ID, BOT_USERNAME
+    me = await application.bot.get_me()
+    BOT_USER_ID = me.id
+    BOT_USERNAME = (me.username or "").lower()
+    log.info(
+        "bot identity: id=%s username=%s privacy_mode_off_expected=%s",
+        BOT_USER_ID, BOT_USERNAME, me.can_read_all_group_messages,
+    )
 
 
 def _read_text(path: Path) -> str:
@@ -93,11 +199,11 @@ def _read_text(path: Path) -> str:
         return ""
 
 
-def _recent_tail(n: int) -> tuple[str, int]:
-    """Return (last n lines of recent.jsonl, total line count). Both empty/0
-    if the file is missing."""
+def _recent_tail(chat_id: int, n: int) -> tuple[str, int]:
+    """Return (last n lines of this chat's recent.jsonl, total line count).
+    Both empty/0 if the file is missing."""
     try:
-        text = RECENT_PATH.read_text(encoding="utf-8")
+        text = _recent_path(chat_id).read_text(encoding="utf-8")
     except FileNotFoundError:
         return "", 0
     lines = [ln for ln in text.splitlines() if ln.strip()]
@@ -107,26 +213,32 @@ def _recent_tail(n: int) -> tuple[str, int]:
 def _build_prompt(
     user_text: str,
     *,
+    chat_id: int,
+    from_name: str,
     image_paths: list[str] | None = None,
     unsupported_kind: str | None = None,
 ) -> str:
-    """Inject memory/* directly so claude doesn't burn tool round-trips Reading
-    them. Each Read in -p mode is a full inference round-trip — eliminating the
-    three (facts/summary/recent) shaves ~15-40s off each turn.
+    """Inject this chat's memory/* directly so claude doesn't burn tool
+    round-trips Reading them. Each Read in -p mode is a full inference round-trip
+    — eliminating the three (facts/summary/recent) shaves ~15-40s off each turn.
 
-    image_paths: absolute paths to image files attached to this turn. Each gets
-    a sibling <image path="..."/> tag and Cas is told to Read them.
-    unsupported_kind: human label like '语音'/'视频' when Li sent a media type
-    we can't ingest yet — replaces user_message body with an apology stub so
-    Cas keeps her own voice instead of a static fallback."""
-    facts = _read_text(FACTS_PATH).strip()
-    summary = _read_text(SUMMARY_PATH).strip()
-    recent_tail, recent_total = _recent_tail(RECENT_TAIL_LINES)
+    chat_id selects which memory/<chat_id>/ subdir's files get loaded; chats are
+    isolated and Cas must not read or write across that boundary.
+    from_name is the display name of the speaker for this turn; it gets stamped
+    into <user_message from="..."> so Cas (a) addresses the right person and
+    (b) can read recent.jsonl tail entries which carry the same field per turn.
+    image_paths: absolute paths Cas should Read for this turn.
+    unsupported_kind: media-type label when we can't ingest the message — the
+    user_message body becomes an apology stub so Cas declines in her own voice."""
+    facts = _read_text(_facts_path(chat_id)).strip()
+    summary = _read_text(_summary_path(chat_id)).strip()
+    recent_tail, recent_total = _recent_tail(chat_id, RECENT_TAIL_LINES)
+    chat_dir = f"memory/{chat_id}"
 
     if unsupported_kind:
         user_block = (
-            f"(Li 给你发了一条 {unsupported_kind}，你现在还接收不了这种媒体——"
-            "用你自己的语气跟她说一下，不要套话)"
+            f"({from_name} 给你发了一条 {unsupported_kind}，你现在还接收不了这种媒体——"
+            "用你自己的语气说一下，不要套话)"
         )
     else:
         user_block = user_text
@@ -146,22 +258,25 @@ def _build_prompt(
         f"<summary>\n{summary}\n</summary>\n\n"
         f'<recent total_lines="{recent_total}" showing_last="{RECENT_TAIL_LINES}">\n'
         f"{recent_tail}\n</recent>\n\n"
-        "A Telegram user just sent you the message in <user_message>. "
+        f'A Telegram user named "{from_name}" just sent you the message in '
+        f"<user_message>. This chat's memory files are at "
+        f"{chat_dir}/{{facts.md, summary.md, recent.jsonl}}. "
         "Context is already loaded above as <facts>, <summary>, <recent> — "
-        "do NOT Read memory/facts.md, memory/summary.md, or "
-        "memory/recent.jsonl yourself, that's wasted round-trips. "
+        "do NOT Read those files yourself, that's wasted round-trips. "
         "Follow CLAUDE.md for everything else: decide your reply, Write a "
-        "long-term fact to memory/facts.md if warranted, then — as the very "
+        f"long-term fact to {chat_dir}/facts.md if warranted, then — as the very "
         "LAST thing — output the reply as plain text. "
-        "Do NOT write to memory/recent.jsonl yourself; the orchestrator "
+        f"Do NOT write to {chat_dir}/recent.jsonl yourself; the orchestrator "
         "records each turn after Telegram confirms delivery. "
         "Compression: total_lines on <recent> is recent.jsonl's full length. "
-        "Only if it exceeds 200 should you Read the full file, summarize the "
-        "earliest 100 lines into memory/summary.md, and trim recent.jsonl. "
-        "Otherwise leave both alone. "
+        f"Only if it exceeds 200 should you Read {chat_dir}/recent.jsonl, "
+        f"summarize the earliest 100 lines into {chat_dir}/summary.md, and "
+        f"trim {chat_dir}/recent.jsonl. Otherwise leave both alone. "
+        "Each chat is isolated; NEVER touch files under any other "
+        "memory/<other_chat_id>/ directory. "
         "Do NOT end on a tool call; the last plain-text message is what "
         "Telegram receives. No preamble, no code fences, no meta-commentary.\n\n"
-        f"<user_message>\n{user_block}\n</user_message>"
+        f'<user_message from="{from_name}">\n{user_block}\n</user_message>'
         f"{image_block}"
     )
 
@@ -171,23 +286,27 @@ def _now_iso() -> str:
 
 
 def _append_turn(
+    chat_id: int,
     user_text: str,
     user_ts: str,
     assistant_text: str,
     assistant_ts: str,
     *,
     image_path: str | None = None,
+    from_name: str | None = None,
 ) -> None:
-    """Append the user/assistant pair to memory/recent.jsonl. Called only after
-    Telegram has accepted the reply, so what's in memory always matches what the
-    user saw. The per-chat lock + the fact that claude has already exited means
-    no concurrent writer can race us.
+    """Append the user/assistant pair to this chat's recent.jsonl. Called only
+    after Telegram has accepted the reply, so what's in memory always matches
+    what the user saw. The per-chat lock + the fact that claude has already
+    exited means no concurrent writer can race us.
 
-    image_path is recorded on the user row when this turn carried a photo. It's
-    intentionally NOT surfaced in the <recent> tail injection — Cas only sees the
-    [图片] caption placeholder there. The path on disk exists for future cleanup
-    hooks (when memory compression moves to cron) and for ad-hoc forensics."""
-    user_row = {"role": "user", "content": user_text, "ts": user_ts}
+    from_name on the user row tells Cas who spoke (read by tail injection).
+    image_path is recorded but intentionally NOT surfaced in the <recent> tail
+    — only [图片] caption text. The path on disk exists for future cleanup hooks
+    (cron compression) and for ad-hoc forensics."""
+    user_row: dict = {"role": "user", "content": user_text, "ts": user_ts}
+    if from_name:
+        user_row["from"] = from_name
     if image_path:
         user_row["image_path"] = image_path
     lines = [
@@ -195,20 +314,24 @@ def _append_turn(
         json.dumps({"role": "assistant", "content": assistant_text, "ts": assistant_ts}, ensure_ascii=False),
     ]
     payload = "\n".join(lines) + "\n"
+    recent_path = _recent_path(chat_id)
     # Defend against a prior writer (e.g. claude compression) leaving no trailing \n.
-    if RECENT_PATH.exists() and RECENT_PATH.stat().st_size > 0:
-        with RECENT_PATH.open("rb") as f:
+    if recent_path.exists() and recent_path.stat().st_size > 0:
+        with recent_path.open("rb") as f:
             f.seek(-1, os.SEEK_END)
             if f.read(1) != b"\n":
                 payload = "\n" + payload
-    with RECENT_PATH.open("a", encoding="utf-8") as f:
+    with recent_path.open("a", encoding="utf-8") as f:
         f.write(payload)
 
 
 VAULT_DIR = "/home/xchen/Documents/sync'd"
 
 
-def _build_args(prompt: str) -> list[str]:
+def _build_args(prompt: str, *, include_vault: bool) -> list[str]:
+    """include_vault gates Cas's read access to Li's Obsidian vault. Only true
+    in 1-1 chats with Li herself; group chats omit the --add-dir so other
+    members can't @-mention Cas into reading vault contents."""
     args = [
         CLAUDE_BIN,
         "-p",
@@ -216,11 +339,11 @@ def _build_args(prompt: str) -> list[str]:
         "Read,Write,Edit,Glob,Grep,WebFetch,WebSearch",
         "--permission-mode",
         "bypassPermissions",
-        "--add-dir",
-        VAULT_DIR,
         "--output-format",
         "text",
     ]
+    if include_vault:
+        args.extend(["--add-dir", VAULT_DIR])
     if CLAUDE_MODEL:
         args.extend(["--model", CLAUDE_MODEL])
     args.append(prompt)
@@ -243,14 +366,27 @@ async def _typing_loop(bot, chat_id: int, stop: asyncio.Event) -> None:
 async def _call_claude(
     user_text: str,
     *,
+    chat_id: int,
+    from_name: str,
+    include_vault: bool,
     image_paths: list[str] | None = None,
     unsupported_kind: str | None = None,
 ) -> str:
     """Invoke `claude -p` and return its stdout. Raises on timeout / non-zero exit."""
     args = _build_args(
-        _build_prompt(user_text, image_paths=image_paths, unsupported_kind=unsupported_kind)
+        _build_prompt(
+            user_text,
+            chat_id=chat_id,
+            from_name=from_name,
+            image_paths=image_paths,
+            unsupported_kind=unsupported_kind,
+        ),
+        include_vault=include_vault,
     )
-    log.info("spawn claude pid=? cwd=%s model=%s", PROJECT_ROOT, CLAUDE_MODEL or "(default)")
+    log.info(
+        "spawn claude chat=%s from=%s vault=%s model=%s",
+        chat_id, from_name, include_vault, CLAUDE_MODEL or "(default)",
+    )
     started = time.monotonic()
     proc = await asyncio.create_subprocess_exec(
         *args,
@@ -290,7 +426,7 @@ def _chunks(s: str, size: int):
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if not _is_authorized(user.id if user else None):
+    if user is None or user.is_bot or not _is_authorized(user.id):
         log.warning("rejected /start from user_id=%s", user.id if user else None)
         return
     await update.message.reply_text(
@@ -324,6 +460,13 @@ async def _run_turn(
                    future cleanup hooks). Only the primary photo of an album
                    is recorded."""
     chat_id = msg.chat_id
+    from_user = msg.from_user
+    from_name = _display_name(from_user)
+    # Vault access is private-chat-only. In TG, a 1-1 chat has chat_id == user_id;
+    # any other chat (group/supergroup) has a different (negative) chat_id, so
+    # we skip --add-dir VAULT_DIR — keeps Cas from leaking Obsidian content
+    # to anyone else who can @-mention her in a group.
+    include_vault = from_user is not None and chat_id == from_user.id
     bot = msg.get_bot()
     async with _chat_locks[chat_id]:
         stop_typing = asyncio.Event()
@@ -332,6 +475,9 @@ async def _run_turn(
             try:
                 reply = await _call_claude(
                     prompt_text,
+                    chat_id=chat_id,
+                    from_name=from_name,
+                    include_vault=include_vault,
                     image_paths=image_paths,
                     unsupported_kind=unsupported_kind,
                 )
@@ -365,14 +511,19 @@ async def _run_turn(
 
         for chunk in _chunks(reply, TELEGRAM_MSG_LIMIT):
             await _send_with_retry(msg, chunk)
-        _append_turn(record_text, user_ts, reply, _now_iso(), image_path=record_image_path)
+        _append_turn(
+            chat_id,
+            record_text, user_ts, reply, _now_iso(),
+            image_path=record_image_path,
+            from_name=from_name,
+        )
         log.info("sent chat=%s reply_len=%d", chat_id, len(reply))
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     msg = update.message
-    if user is None or msg is None or msg.text is None:
+    if user is None or user.is_bot or msg is None or msg.text is None:
         return
     if not _is_authorized(user.id):
         log.warning(
@@ -380,6 +531,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             user.id, user.username, msg.text[:60],
         )
         return
+    if not _is_addressed(msg):
+        return  # group chat noise: not @-mentioning Cas, not replying to her
     text = msg.text
     user_ts = _now_iso()
     log.info("recv kind=text chat=%s user=%s len=%d", msg.chat_id, user.id, len(text))
@@ -389,10 +542,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def on_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     msg = update.message
-    if user is None or msg is None or msg.sticker is None:
+    if user is None or user.is_bot or msg is None or msg.sticker is None:
         return
     if not _is_authorized(user.id):
         log.warning("rejected sticker user_id=%s", user.id)
+        return
+    if not _is_addressed(msg):
         return
     emoji = msg.sticker.emoji or ""
     text = f"[贴纸] {emoji}".rstrip()
@@ -420,10 +575,12 @@ def _unsupported_kind(msg) -> str | None:
 async def on_unsupported(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     msg = update.message
-    if user is None or msg is None:
+    if user is None or user.is_bot or msg is None:
         return
     if not _is_authorized(user.id):
         log.warning("rejected unsupported media user_id=%s", user.id)
+        return
+    if not _is_addressed(msg):
         return
     kind = _unsupported_kind(msg)
     if kind is None:
@@ -444,15 +601,28 @@ async def on_unsupported(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     msg = update.message
-    if user is None or msg is None or not msg.photo:
+    if user is None or user.is_bot or msg is None or not msg.photo:
         return
     if not _is_authorized(user.id):
         log.warning("rejected photo user_id=%s", user.id)
         return
 
     chat_id = msg.chat_id
+    # Album follow-on photos in groups don't carry the @-mention (TG only puts
+    # caption on the first photo), so we accept them if their group's buffer
+    # is already open from an addressed leading photo. Single photos and
+    # album-leaders go through the regular addressed check.
+    if msg.media_group_id and chat_id != getattr(msg.from_user, "id", None):
+        key = (chat_id, msg.media_group_id)
+        async with _album_lock:
+            already_open = key in _album_buffers
+        if not already_open and not _is_addressed(msg):
+            return
+    elif not _is_addressed(msg):
+        return
+
     photo = msg.photo[-1]  # largest size TG generates
-    path = MEDIA_DIR / f"{chat_id}_{msg.message_id}.jpg"
+    path = _media_dir(chat_id) / f"{msg.message_id}.jpg"
     caption = msg.caption or ""
     log.info(
         "recv kind=photo chat=%s msg=%s media_group=%s caption_len=%d",
@@ -590,6 +760,7 @@ def main() -> None:
         .write_timeout(30.0)
         .pool_timeout(10.0)
         .get_updates_read_timeout(40.0)
+        .post_init(_post_init)
         .build()
     )
     app.add_handler(CommandHandler("start", cmd_start))
