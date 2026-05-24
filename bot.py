@@ -35,6 +35,12 @@ LOG_DIR.mkdir(exist_ok=True)
 MEMORY_DIR = PROJECT_ROOT / "memory"
 MEMORY_DIR.mkdir(exist_ok=True)
 RECENT_TAIL_LINES = 30  # how many recent.jsonl lines to inject into the prompt
+RECENT_HARD_CAP = 200   # trim recent.jsonl once it grows past this many lines...
+RECENT_KEEP = 100       # ...down to this many most-recent lines. The dropped
+                        # oldest lines are archived verbatim to archive.jsonl and
+                        # summarized into summary.md out-of-band. This is the
+                        # deterministic bound that replaces the old in-band model
+                        # compression (which deadlocked — see _trim_recent).
 ALBUM_DEBOUNCE_S = 1.5  # wait this long after the latest media-group photo before flushing
 
 # Memory is per-chat: memory/<chat_id>/{facts.md, summary.md, recent.jsonl, media/}.
@@ -60,6 +66,12 @@ def _recent_path(chat_id: int) -> Path:
     return _chat_dir(chat_id) / "recent.jsonl"
 
 
+def _archive_path(chat_id: int) -> Path:
+    # Verbatim cold storage for turns trimmed out of recent.jsonl. Never read on
+    # the hot path; it's the raw backstop if out-of-band summarization fails.
+    return _chat_dir(chat_id) / "archive.jsonl"
+
+
 def _media_dir(chat_id: int) -> Path:
     p = _chat_dir(chat_id) / "media"
     p.mkdir(exist_ok=True)
@@ -71,6 +83,9 @@ load_dotenv(PROJECT_ROOT / ".env")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "").strip()
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "120"))
+# Out-of-band summarization runs off the reply path, so it can afford a longer
+# ceiling than a live reply. Still bounded so a stuck summarizer can't pile up.
+SUMMARY_TIMEOUT = int(os.environ.get("SUMMARY_TIMEOUT_SECONDS", "180"))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude").strip()
 
 _raw_ids = os.environ.get("ALLOWED_USER_IDS", "")
@@ -117,6 +132,13 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("tg-companion")
 
 _chat_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+# Serializes summary.md writes per chat so two back-to-back trims can't interleave
+# their out-of-band appends. Separate from _chat_locks so summarization never
+# blocks (or is blocked by) the live reply path.
+_summary_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+# Strong refs to detached summarization tasks so the event loop doesn't GC them
+# mid-flight (asyncio only holds weak refs to tasks).
+_bg_tasks: set[asyncio.Task] = set()
 # Buffers media-group photos until the group goes quiet for ALBUM_DEBOUNCE_S so
 # we can fire a single Cas turn over the whole album rather than one per photo.
 _album_buffers: dict[tuple[int, str], dict] = {}
@@ -268,10 +290,10 @@ def _build_prompt(
         "LAST thing — output the reply as plain text. "
         f"Do NOT write to {chat_dir}/recent.jsonl yourself; the orchestrator "
         "records each turn after Telegram confirms delivery. "
-        "Compression: total_lines on <recent> is recent.jsonl's full length. "
-        f"Only if it exceeds 200 should you Read {chat_dir}/recent.jsonl, "
-        f"summarize the earliest 100 lines into {chat_dir}/summary.md, and "
-        f"trim {chat_dir}/recent.jsonl. Otherwise leave both alone. "
+        f"The orchestrator also fully owns compaction — it trims "
+        f"{chat_dir}/recent.jsonl and writes {chat_dir}/summary.md (and "
+        f"{chat_dir}/archive.jsonl) out-of-band. Do NOT read, summarize, or "
+        "trim any of those yourself, regardless of total_lines on <recent>. "
         "Each chat is isolated; NEVER touch files under any other "
         "memory/<other_chat_id>/ directory. "
         "Do NOT end on a tool call; the last plain-text message is what "
@@ -323,6 +345,180 @@ def _append_turn(
                 payload = "\n" + payload
     with recent_path.open("a", encoding="utf-8") as f:
         f.write(payload)
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write via temp file + os.replace so a reader (e.g. the next _build_prompt)
+    never sees a half-written file. os.replace is atomic within a filesystem."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _append_lines(path: Path, lines: list[str]) -> None:
+    """Append newline-terminated lines, healing a missing trailing newline on the
+    existing file first (same guard as _append_turn)."""
+    if not lines:
+        return
+    payload = "\n".join(lines) + "\n"
+    if path.exists() and path.stat().st_size > 0:
+        with path.open("rb") as f:
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) != b"\n":
+                payload = "\n" + payload
+    with path.open("a", encoding="utf-8") as f:
+        f.write(payload)
+
+
+def _trim_recent(chat_id: int) -> list[str]:
+    """Bound this chat's recent.jsonl. If it exceeds RECENT_HARD_CAP lines, drop
+    the oldest down to RECENT_KEEP, archiving the dropped lines verbatim to
+    archive.jsonl first, and return them (oldest-first) so the caller can
+    summarize them out-of-band. Returns [] when no trim was needed.
+
+    This is the deterministic replacement for the old in-band compression the
+    model did mid-turn. That coupled the only size-bound to a slow operation on
+    the reply path: once a turn got slow enough to be killed, it never recorded,
+    so the line count never dropped, so every later turn re-triggered the same
+    slow path and timed out — a self-perpetuating deadlock (hit 2026-05-24).
+    Running the trim here, in bot.py, after a successful send and with no claude
+    process alive, means the bound is applied no matter how the model turn went.
+    Caller must hold the per-chat lock."""
+    path = _recent_path(chat_id)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) <= RECENT_HARD_CAP:
+        return []
+    dropped = lines[:-RECENT_KEEP]
+    kept = lines[-RECENT_KEEP:]
+    _append_lines(_archive_path(chat_id), dropped)
+    _atomic_write(path, "\n".join(kept) + "\n")
+    log.info(
+        "trimmed recent chat=%s %d->%d lines (archived %d, queued for summary)",
+        chat_id, len(lines), len(kept), len(dropped),
+    )
+    return dropped
+
+
+def _render_turns(lines: list[str]) -> str:
+    """Flatten jsonl turns into a readable transcript for the summarizer prompt."""
+    rows = []
+    for ln in lines:
+        try:
+            o = json.loads(ln)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        who = "Cas" if o.get("role") == "assistant" else (o.get("from") or "?")
+        ts = (o.get("ts") or "")[:16]
+        content = (o.get("content") or "").replace("\n", " ")
+        rows.append(f"[{ts}] {who}: {content}")
+    return "\n".join(rows)
+
+
+def _summary_date_range(lines: list[str]) -> str:
+    """'YYYY-MM-DD ~ YYYY-MM-DD' (or a single date) from the dropped lines' ts."""
+    dates = []
+    for ln in lines:
+        try:
+            ts = json.loads(ln).get("ts", "")
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if ts:
+            dates.append(ts[:10])
+    if not dates:
+        return _now_iso()[:10]
+    return dates[0] if dates[0] == dates[-1] else f"{dates[0]} ~ {dates[-1]}"
+
+
+def _build_summary_prompt(chat_id: int, dropped: list[str]) -> str:
+    """Pure-text summarization: the model gets the dropped turns plus the existing
+    summary (for style + de-dup) and returns ONLY the new summary prose. bot.py,
+    not the model, writes the file — so this call needs no tools and can't race."""
+    prior = _read_text(_summary_path(chat_id)).strip()
+    transcript = _render_turns(dropped)
+    return (
+        "你在维护一个 Telegram 聊天伴侣 Cas 的长期记忆。下面 <待总结> 里是一批即将从"
+        "最近对话里滚出的旧消息（最早在前）。把它们压缩成 1-3 段中文总结，供 Cas 以后"
+        "回顾。保留：关键事实、情绪走向、提到的决定/承诺、反复出现的话题。不用 bullet "
+        "points，不用 emoji。只输出总结正文本身——不要加日期标题，不要任何前后缀、解释"
+        "或工具调用。\n\n"
+        f"<已有总结 仅供风格参考与去重>\n{prior}\n</已有总结>\n\n"
+        f"<待总结>\n{transcript}\n</待总结>"
+    )
+
+
+async def _summarize_dropped(chat_id: int, dropped: list[str]) -> None:
+    """Out-of-band: fold the just-trimmed turns into summary.md. Detached from the
+    reply path, so it never delays Li's reply nor counts against CLAUDE_TIMEOUT.
+    Best-effort: on any failure the raw turns remain in archive.jsonl for later
+    recovery and the bot keeps working. summary.md is written by bot.py (under
+    _summary_locks) from the model's plain-text output, not by the model itself."""
+    if not dropped:
+        return
+    args = [CLAUDE_BIN, "-p", "--allowedTools", "", "--output-format", "text"]
+    if CLAUDE_MODEL:
+        args.extend(["--model", CLAUDE_MODEL])
+    args.append(_build_summary_prompt(chat_id, dropped))
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            cwd=str(PROJECT_ROOT),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=SUMMARY_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "summary claude timed out chat=%s; %d turns safe in archive.jsonl",
+                chat_id, len(dropped),
+            )
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+            return
+        if proc.returncode != 0:
+            log.error(
+                "summary claude exited %s chat=%s: %s",
+                proc.returncode, chat_id, stderr.decode(errors="replace")[:300],
+            )
+            return
+        summary_text = stdout.decode(errors="replace").strip()
+        if not summary_text:
+            log.warning("summary claude returned empty chat=%s", chat_id)
+            return
+        header = _summary_date_range(dropped)
+        block = f"## {header}\n\n{summary_text}\n"
+        async with _summary_locks[chat_id]:
+            prior = _read_text(_summary_path(chat_id)).rstrip()
+            if prior:
+                new_text = f"{prior}\n\n{block}"
+            else:
+                new_text = f"# 历史对话总结\n\n{block}"
+            _atomic_write(_summary_path(chat_id), new_text)
+        log.info(
+            "summary appended chat=%s range='%s' chars=%d",
+            chat_id, header, len(summary_text),
+        )
+    except Exception:
+        log.exception("summarize_dropped failed chat=%s", chat_id)
+
+
+def _spawn_summary(chat_id: int, dropped: list[str]) -> None:
+    """Fire-and-forget the summarizer, keeping a strong ref until it finishes."""
+    if not dropped:
+        return
+    task = asyncio.create_task(_summarize_dropped(chat_id, dropped))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
 
 
 VAULT_DIR = "/home/xchen/Documents/sync'd"
@@ -518,6 +714,12 @@ async def _run_turn(
             from_name=from_name,
         )
         log.info("sent chat=%s reply_len=%d", chat_id, len(reply))
+        # Out-of-band maintenance: bound recent.jsonl deterministically now that
+        # the turn is safely recorded, then summarize the dropped tail off the
+        # reply path. Both happen after the reply is delivered, so neither can
+        # delay or deadlock Li's conversation.
+        dropped = _trim_recent(chat_id)
+        _spawn_summary(chat_id, dropped)
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
