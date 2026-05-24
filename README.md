@@ -32,12 +32,16 @@ Telegram update
             └─> reply_text() → Telegram (with retry on transient timeouts)
             └─> orchestrator appends the turn to memory/recent.jsonl
                 only after Telegram confirms delivery
+            └─> orchestrator trims recent.jsonl past 200 lines → archive.jsonl,
+                then summarizes the dropped turns into summary.md out-of-band
+                (a separate detached claude -p, off the reply path)
 ```
 
-The orchestration in `bot.py` is intentionally dumb. All the interesting
-choices — what Cas (or your persona) reads, when she updates memory, when she
-compacts old turns into a summary — live in `CLAUDE.md` and are easy to tweak
-without touching Python.
+The orchestration in `bot.py` is intentionally dumb. Most interesting choices —
+what Cas (or your persona) reads, when she updates memory — live in `CLAUDE.md`
+and are easy to tweak without touching Python. The one exception is compaction:
+bounding `recent.jsonl` and growing `summary.md` is owned by `bot.py` and runs
+out-of-band *after* the reply is sent, so it can never delay or deadlock a turn.
 
 ## Supported message types
 
@@ -86,8 +90,9 @@ find your bot, send `/start`, then send a message.
 | `CLAUDE.md.example` | Template for the persona + behavior instructions. **Copy to `CLAUDE.md` and fill in.** Auto-loaded by `claude -p` from cwd. Your `CLAUDE.md` is gitignored. |
 | `.env.example` | Template for runtime config. Copy to `.env`. |
 | `memory/facts.md` | Long-term facts about the user. Updated by Claude when it learns durable info. (Created on first run.) |
-| `memory/summary.md` | Rolling summary of older turns. Appended to when `recent.jsonl` exceeds 200 lines. |
-| `memory/recent.jsonl` | Recent raw turns (user + assistant), JSON-per-line. Appended every reply. Compacted at 200 lines. Photo turns carry an `image_path` field on the user row. |
+| `memory/summary.md` | Rolling summary of older turns. Grown by an out-of-band `claude -p` whenever `recent.jsonl` is trimmed. |
+| `memory/recent.jsonl` | Recent raw turns (user + assistant), JSON-per-line. Appended every reply. Trimmed by `bot.py` to the most recent ~100 lines once it passes 200. Photo turns carry an `image_path` field on the user row. |
+| `memory/archive.jsonl` | Verbatim cold storage of turns trimmed out of `recent.jsonl`. The raw backstop if out-of-band summarization ever fails; never read on the hot path. |
 | `memory/media/` | Photos sent by the user, named `<chat_id>_<msg_id>.jpg`. Currently retained indefinitely; cleanup will land alongside cron-driven compaction. |
 | `logs/bot.log` | Rotating log (5 × 2 MB). |
 
@@ -184,8 +189,9 @@ feel off. Two options:
   handled — Claude just declines verbally for now)
 - **Outbound** sticker reactions from Claude (incoming stickers are routed as
   emoji text)
-- Cron-driven memory compaction, including cleanup of `memory/media/`
-  photos that get summarized out of `recent.jsonl`
+- Cleanup of `memory/media/` photos whose turns have been trimmed out of
+  `recent.jsonl` (text compaction is done — `bot.py` trims + summarizes
+  out-of-band — but the saved photo files are still left on disk)
 
 ## License
 
