@@ -34,7 +34,8 @@ Telegram update
                 only after Telegram confirms delivery
             └─> orchestrator trims recent.jsonl past 200 lines → archive.jsonl,
                 then summarizes the dropped turns into summary.md out-of-band
-                (a separate detached claude -p, off the reply path)
+                (a separate detached claude -p, off the reply path), and
+                garbage-collects media/ photos no longer referenced by recent.jsonl
 ```
 
 The orchestration in `bot.py` is intentionally dumb. Most interesting choices —
@@ -48,7 +49,7 @@ out-of-band *after* the reply is sent, so it can never delay or deadlock a turn.
 | Incoming | Behavior |
 |---|---|
 | Text | Plain pass-through. |
-| Photo (single) | Downloaded to `memory/media/<chat_id>_<msg_id>.jpg`; Claude reads it via the `Read` tool and replies. |
+| Photo (single) | Downloaded to `memory/<chat_id>/media/<msg_id>.jpg`; Claude reads it via the `Read` tool and replies. |
 | Photo album (media group) | Debounced 1.5 s, then handled as a single turn with multiple `<image>` attachments. |
 | Sticker | Routed as text `[贴纸] {emoji}` — the sticker's emoji is what reaches Claude. No image fetch. |
 | Voice / video / audio / document | The orchestrator hands Claude an apology stub so the persona can decline in its own voice instead of a hardcoded fallback. |
@@ -93,7 +94,7 @@ find your bot, send `/start`, then send a message.
 | `memory/summary.md` | Rolling summary of older turns. Grown by an out-of-band `claude -p` whenever `recent.jsonl` is trimmed. |
 | `memory/recent.jsonl` | Recent raw turns (user + assistant), JSON-per-line. Appended every reply. Trimmed by `bot.py` to the most recent ~100 lines once it passes 200. Photo turns carry an `image_path` field on the user row. |
 | `memory/archive.jsonl` | Verbatim cold storage of turns trimmed out of `recent.jsonl`. The raw backstop if out-of-band summarization ever fails; never read on the hot path. |
-| `memory/media/` | Photos sent by the user, named `<chat_id>_<msg_id>.jpg`. Currently retained indefinitely; cleanup will land alongside cron-driven compaction. |
+| `memory/<chat_id>/media/` | Photos sent by the user, named `<msg_id>.jpg`. Garbage-collected after each turn: files no longer referenced by the chat's live `recent.jsonl` (rolled-out turns, album siblings) are deleted. |
 | `logs/bot.log` | Rotating log (5 × 2 MB). |
 
 ## Configuration knobs (`.env`)
@@ -189,9 +190,6 @@ feel off. Two options:
   handled — Claude just declines verbally for now)
 - **Outbound** sticker reactions from Claude (incoming stickers are routed as
   emoji text)
-- Cleanup of `memory/media/` photos whose turns have been trimmed out of
-  `recent.jsonl` (text compaction is done — `bot.py` trims + summarizes
-  out-of-band — but the saved photo files are still left on disk)
 
 ## License
 

@@ -403,6 +403,52 @@ def _trim_recent(chat_id: int) -> list[str]:
     return dropped
 
 
+def _gc_media(chat_id: int) -> int:
+    """Delete media files no longer referenced by this chat's live recent.jsonl,
+    returning the count removed. A photo is only ever Read on the turn it arrives
+    (past turns' images are never re-surfaced to Cas), so once a turn rolls out of
+    the live window — or for album sibling photos, which are never recorded (only
+    the album's primary path lands on the user row) — the file is dead weight.
+    Keeping exactly the set referenced by recent.jsonl bounds media/ and preserves
+    the image_path->file link for the live window. Trimmed turns live on as text
+    in archive.jsonl; their photos are intentionally not kept (that's the point of
+    the cleanup). Caller holds the per-chat lock."""
+    media = _chat_dir(chat_id) / "media"
+    if not media.is_dir():
+        return 0
+    files = [p for p in media.iterdir() if p.is_file()]
+    if not files:
+        return 0
+    referenced: set[str] = set()
+    try:
+        text = _recent_path(chat_id).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
+    for ln in text.splitlines():
+        if not ln.strip():
+            continue
+        try:
+            ip = json.loads(ln).get("image_path")
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if ip:
+            referenced.add(os.path.basename(ip))
+    deleted = 0
+    for p in files:
+        if p.name in referenced:
+            continue
+        try:
+            p.unlink()
+            deleted += 1
+        except OSError:
+            log.exception("media gc: failed to unlink %s", p)
+    if deleted:
+        log.info(
+            "media gc chat=%s deleted=%d kept=%d", chat_id, deleted, len(referenced)
+        )
+    return deleted
+
+
 def _render_turns(lines: list[str]) -> str:
     """Flatten jsonl turns into a readable transcript for the summarizer prompt."""
     rows = []
@@ -720,6 +766,7 @@ async def _run_turn(
         # delay or deadlock Li's conversation.
         dropped = _trim_recent(chat_id)
         _spawn_summary(chat_id, dropped)
+        _gc_media(chat_id)
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
